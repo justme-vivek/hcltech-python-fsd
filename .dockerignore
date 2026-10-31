@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+var
+certs
+gateway/certs
+logs
+reports
+analytics/outputs

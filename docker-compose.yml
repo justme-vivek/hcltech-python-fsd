@@ -1,0 +1,196 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?set POSTGRES_ADMIN_PASSWORD in .env}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:?set AUTH_DB_PASSWORD in .env}
+      PRODUCT_DB_PASSWORD: ${PRODUCT_DB_PASSWORD:?set PRODUCT_DB_PASSWORD in .env}
+      CART_DB_PASSWORD: ${CART_DB_PASSWORD:?set CART_DB_PASSWORD in .env}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD:?set ORDER_DB_PASSWORD in .env}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?set NOTIFICATION_DB_PASSWORD in .env}
+    volumes: [pgdata:/var/lib/postgresql/data, ./infra/postgres/init-databases.sh:/docker-entrypoint-initdb.d/01-init.sh:ro]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [backend]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [backend]
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+      - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks: [backend]
+    restart: unless-stopped
+
+  auth-service: &app
+    build: .
+    command: ["/app/scripts/run_service.sh"]
+    environment:
+      SERVICE_NAME: auth
+      SERVICE_PORT: "8001"
+      DATABASE_URL_AUTH: postgresql://auth_user:${AUTH_DB_PASSWORD}@postgres:5432/auth_db
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      REQUIRE_MTLS: "true"
+      MTLS_CA_FILE: /certs/ca.crt
+      MTLS_CERT_FILE: /certs/auth.crt
+      MTLS_KEY_FILE: /certs/auth.key
+    volumes: [./certs:/certs:ro]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 10s
+      timeout: 4s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  product-service:
+    <<: *app
+    environment:
+      SERVICE_NAME: product
+      SERVICE_PORT: "8002"
+      DATABASE_URL_PRODUCT: postgresql://product_user:${PRODUCT_DB_PASSWORD}@postgres:5432/product_db
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      REQUIRE_MTLS: "true"
+      MTLS_CA_FILE: /certs/ca.crt
+      MTLS_CERT_FILE: /certs/product.crt
+      MTLS_KEY_FILE: /certs/product.key
+
+  cart-service:
+    <<: *app
+    environment:
+      SERVICE_NAME: cart
+      SERVICE_PORT: "8003"
+      DATABASE_URL_CART: postgresql://cart_user:${CART_DB_PASSWORD}@postgres:5432/cart_db
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      PRODUCT_SERVICE_URL: https://product-service:8002
+      REQUIRE_MTLS: "true"
+      MTLS_CA_FILE: /certs/ca.crt
+      MTLS_CERT_FILE: /certs/cart.crt
+      MTLS_KEY_FILE: /certs/cart.key
+    depends_on:
+      product-service: {condition: service_healthy}
+
+  order-service:
+    <<: *app
+    environment:
+      SERVICE_NAME: order
+      SERVICE_PORT: "8004"
+      DATABASE_URL_ORDER: postgresql://order_user:${ORDER_DB_PASSWORD}@postgres:5432/order_db
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CART_SERVICE_URL: https://cart-service:8003
+      PRODUCT_SERVICE_URL: https://product-service:8002
+      AMQP_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      REQUIRE_MTLS: "true"
+      MTLS_CA_FILE: /certs/ca.crt
+      MTLS_CERT_FILE: /certs/order.crt
+      MTLS_KEY_FILE: /certs/order.key
+    depends_on:
+      cart-service: {condition: service_healthy}
+      product-service: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+
+  notification-service:
+    <<: *app
+    environment:
+      SERVICE_NAME: notification
+      SERVICE_PORT: "8005"
+      DATABASE_URL_NOTIFICATION: postgresql://notification_user:${NOTIFICATION_DB_PASSWORD}@postgres:5432/notification_db
+      JWT_SECRET: ${JWT_SECRET}
+      AMQP_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      REQUIRE_MTLS: "true"
+      MTLS_CA_FILE: /certs/ca.crt
+      MTLS_CERT_FILE: /certs/notification.crt
+      MTLS_KEY_FILE: /certs/notification.key
+    depends_on:
+      postgres: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+
+  outbox-relay:
+    build: .
+    command: ["python", "-m", "scripts.outbox_relay"]
+    environment:
+      DATABASE_URL_ORDER: postgresql://order_user:${ORDER_DB_PASSWORD}@postgres:5432/order_db
+      AMQP_URL: amqps://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5671/
+      AMQP_TLS_CA_FILE: /certs/ca.crt
+      AMQP_TLS_CERT_FILE: /certs/order.crt
+      AMQP_TLS_KEY_FILE: /certs/order.key
+    volumes: [./certs:/certs:ro]
+    depends_on:
+      postgres: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    networks: [backend]
+    restart: unless-stopped
+
+  notification-consumer:
+    build: .
+    command: ["python", "-m", "scripts.notification_consumer"]
+    environment:
+      DATABASE_URL_NOTIFICATION: postgresql://notification_user:${NOTIFICATION_DB_PASSWORD}@postgres:5432/notification_db
+      AMQP_URL: amqps://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5671/
+      AMQP_TLS_CA_FILE: /certs/ca.crt
+      AMQP_TLS_CERT_FILE: /certs/notification.crt
+      AMQP_TLS_KEY_FILE: /certs/notification.key
+    volumes: [./certs:/certs:ro]
+    depends_on:
+      postgres: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    networks: [backend]
+    restart: unless-stopped
+
+  gateway:
+    image: nginx:1.27-alpine
+    ports: ["${GATEWAY_PORT:-8443}:443"]
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/certs:ro
+    depends_on:
+      auth-service: {condition: service_healthy}
+      product-service: {condition: service_healthy}
+      cart-service: {condition: service_healthy}
+      order-service: {condition: service_healthy}
+      notification-service: {condition: service_healthy}
+    networks: [backend]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitdata:
+networks:
+  backend:
+    internal: false

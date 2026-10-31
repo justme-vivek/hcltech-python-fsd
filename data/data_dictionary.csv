@@ -1,0 +1,8 @@
+column_name,data_type,description
+timestamp,datetime string,Time at which the API call was logged; YYYY-MM-DD HH:MM:SS
+service_name,categorical string,Microservice that handled the API call
+endpoint,string,Request path invoked
+method,categorical string,HTTP method used for the request
+response_time_ms,integer,Time taken to respond in milliseconds
+status_code,integer categorical,HTTP status code returned
+user_id,anonymised string,Anonymised identifier of the calling user
